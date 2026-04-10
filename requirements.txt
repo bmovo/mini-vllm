@@ -1,0 +1,2 @@
+# Install a CUDA-specific torch wheel on Ubuntu if you plan to benchmark on GPU.
+torch>=2.1
