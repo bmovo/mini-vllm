@@ -1,618 +1,587 @@
 # one
 
-这份文档先只回答一个问题：当前 `mini-vllm` 里每一个 class 到底在做什么。
+这份文档重新来一版。
 
-你可以先把整个项目粗略分成两层：
+目标只有一个：
 
-- 模型层：负责“给定 token，怎么计算下一个 token 的概率”
-- 引擎层：负责“多个请求什么时候一起算，KV cache 怎么保存和复用”
+不要一上来追求“术语全懂”，而是先搞明白这个项目里每个 class 扮演什么角色。
 
----
+如果你刚接触 LLM 推理代码，最容易卡住的点是：
 
-## 1. 整体结构
+- 代码里每个名字都像懂了，但连起来不知道在干嘛
+- 每一句都对，但读完脑子里没有画面
 
-当前项目里主要有 9 个 class：
+所以这一版我会尽量只做三件事：
 
-### 模型层
-
-1. `ModelConfig`
-2. `DecoderOnlyTransformerOutput`
-3. `FeedForward`
-4. `CausalSelfAttention`
-5. `DecoderLayer`
-6. `DecoderOnlyTransformer`
-
-### 引擎层
-
-1. `GenerationResult`
-2. `_RequestState`
-3. `MiniLLMEngine`
-
-如果只看调用链，可以理解成：
-
-`ModelConfig` -> `DecoderOnlyTransformer` -> `MiniLLMEngine`
-
-也就是：
-
-- `ModelConfig` 定义模型长什么样
-- `DecoderOnlyTransformer` 负责真正的神经网络计算
-- `MiniLLMEngine` 负责把多个请求组织起来，驱动模型做 prefill 和 decode
+1. 先把几个必须知道的词讲清楚
+2. 再讲每个 class 像什么
+3. 最后讲这些 class 是怎么串起来工作的
 
 ---
 
-## 2. 每个 class 在做什么
+## 1. 先别急着看 class，先懂 7 个词
 
-## 2.1 `ModelConfig`
+如果下面这几个词不顺，后面所有类都会看着费劲。
+
+## 1.1 token
+
+你可以先把 token 理解成“文本被切出来的小块”。
+
+例如一句话不会直接送进模型，而是先变成 token，再变成数字 id。
+
+所以模型真正吃进去的，不是字符串，而是很多整数。
+
+---
+
+## 1.2 embedding
+
+embedding 可以先理解成：
+
+“把一个整数 token id 变成一个向量。”
+
+因为神经网络不能直接理解 `12`、`304`、`998` 这种 token id 的语义，所以要先把它们映射成向量。
+
+你现在不用关心向量内部长什么样，只要知道：
+
+- 输入一串 token id
+- 输出一串向量
+
+---
+
+## 1.3 前向计算
+
+前向计算就是：
+
+把输入送进模型，一层一层算下去，最后得到输出。
+
+在这个项目里，你可以先把它理解成：
+
+- 输入：一串 token id
+- 输出：模型认为“下一个 token 应该是什么”的分数
+
+---
+
+## 1.4 logits
+
+logits 是模型最后输出的一堆分数。
+
+它还不是最终选中的 token，只是表示：
+
+- 词表里的每个 token，有多像下一个 token
+
+分数越大，说明模型越倾向选它。
+
+你可以先把 logits 理解成“候选答案分数表”。
+
+---
+
+## 1.5 attention
+
+attention 最粗糙、但最有用的理解是：
+
+“当前 token 在更新自己时，会参考别的 token。”
+
+比如一句话里，一个词想知道自己该怎么理解，不能只看自己，还得参考前面的词。
+
+所以 attention 做的事可以先理解成：
+
+- 当前 token 去看看别的 token
+- 判断哪些 token 更重要
+- 把它们的信息拿过来一点
+
+这里的“看”不是真的看，而是“给别的 token 分配权重”。
+
+---
+
+## 1.6 KV cache
+
+KV cache 可以先理解成：
+
+“把已经算过的历史信息存起来，下次别再重复算。”
+
+如果模型已经看过前面 100 个 token，再生成第 101 个 token 时，没必要把前 100 个全重新算一遍。
+
+所以会把历史信息缓存起来。
+
+这就是 KV cache 最重要的意义：
+
+- 少做重复计算
+- 让生成更快
+
+---
+
+## 1.7 engine
+
+engine 可以先理解成：
+
+“模型外面的调度器。”
+
+模型本体只负责算。
+
+engine 负责：
+
+- 请求什么时候进来
+- 哪些请求一起组成 batch
+- 哪些请求已经生成了一半
+- 哪些请求该结束了
+
+如果把模型看成发动机，engine 就像司机和调度系统。
+
+---
+
+## 2. 先从更高一层看：这个项目其实只有两大部分
+
+你可以先把当前项目拆成两块：
+
+### 第一块：模型本体
+
+这一块负责：
+
+“给我一些 token，我来算下一个 token 的分数。”
+
+对应的主要类是：
+
+- `ModelConfig`
+- `FeedForward`
+- `CausalSelfAttention`
+- `DecoderLayer`
+- `DecoderOnlyTransformer`
+- `DecoderOnlyTransformerOutput`
+
+### 第二块：推理引擎
+
+这一块负责：
+
+“如果同时有很多请求进来，我该怎么组织它们去调用模型，才能更高效？”
+
+对应的主要类是：
+
+- `_RequestState`
+- `GenerationResult`
+- `MiniLLMEngine`
+
+所以先记住一句话：
+
+- 模型负责“怎么算”
+- 引擎负责“什么时候算、哪些请求一起算”
+
+---
+
+## 3. 每个 class 到底像什么
+
+这一节不追求完整，只追求脑子里先有画面。
+
+---
+
+## 3.1 `ModelConfig`
 
 文件位置：`mini_vllm/config.py`
 
-这个类是模型配置对象，也可以理解成“超参数说明书”。
+你可以把它理解成：
 
-它不参与任何实际计算，只负责保存这些信息：
+“模型的参数说明书。”
 
-- 词表大小 `vocab_size`
-- 最大位置长度 `max_position_embeddings`
-- 隐层维度 `hidden_size`
-- decoder block 层数 `num_hidden_layers`
-- attention 头数 `num_attention_heads`
-- FFN 中间层大小 `intermediate_size`
-- dropout 和 layer norm 的相关参数
-- 是否让 `lm_head` 和 `token_embedding` 共享权重
+它里面写的是：
 
-它的 `__post_init__()` 里做了一件必要的检查：
+- 词表有多大
+- 最长支持多少位置
+- 隐藏层维度多大
+- 一共有几层
+- attention 有几个头
+- FFN 中间层多大
 
-- `hidden_size` 必须能被 `num_attention_heads` 整除
+它自己不负责计算。
 
-为什么要检查这个？
+它只是告诉模型：
 
-因为 attention 里会把 hidden dimension 切成多个 head，如果不能整除，就没法分成等宽的 heads。
+“你应该长成什么样。”
 
-一句话总结：
+### 你现在只需要记住
 
-`ModelConfig` 负责定义模型结构参数，并在模型创建前做基础合法性校验。
+`ModelConfig` 不是模型本身，它只是模型的配置表。
 
 ---
 
-## 2.2 `DecoderOnlyTransformerOutput`
+## 3.2 `FeedForward`
 
 文件位置：`mini_vllm/model.py`
 
-这个类是模型前向计算的返回结果包装。
+你可以把它理解成：
 
-里面有三个字段：
+“对每个 token 做一次单独加工的小模块。”
 
-- `logits`：每个位置对整个词表的预测分数
-- `hidden_states`：最后一层的隐藏状态
-- `past_key_values`：每层缓存下来的 KV cache
+attention 负责让 token 参考别的 token。
 
-为什么要单独定义这个类，而不是直接返回一个 tuple？
+`FeedForward` 负责在参考完之后，再把这个 token 自己的表示加工一下。
 
-因为 tuple 可读性差，后面引擎取值时不直观。定义成 dataclass 以后，调用方可以直接写：
+所以它更像：
 
-```python
-outputs.logits
-outputs.past_key_values
-```
+- attention：交流信息
+- FFN：自己消化信息
 
-一句话总结：
+### 你现在只需要记住
 
-`DecoderOnlyTransformerOutput` 是模型输出的结构化容器，方便引擎读取 logits 和 KV cache。
+`FeedForward` 不负责 token 和 token 之间的关系，它负责“单个 token 自己的特征变换”。
 
 ---
 
-## 2.3 `FeedForward`
+## 3.3 `CausalSelfAttention`
 
 文件位置：`mini_vllm/model.py`
 
-这个类实现 Transformer block 里的 FFN 子层。
+你可以把它理解成：
 
-结构很简单：
+“让当前 token 去参考前面 token 的模块。”
 
-1. `fc_in`：把 hidden size 投影到更大的 `intermediate_size`
-2. `GELU` 激活函数
-3. `fc_out`：再投影回 hidden size
-4. dropout
+这里最关键的是 `causal`。
 
-FFN 的作用不是处理 token 与 token 的关系，而是对“每个 token 自己的表示”做更强的非线性变换。
+`causal` 的意思是：
 
-可以这样理解：
+- 只能看当前位置以及前面
+- 不能看未来
 
-- attention 负责“看别人”
-- FFN 负责“加工自己”
+为什么？
 
-一句话总结：
+因为语言模型是一个字一个字往后生成的。
 
-`FeedForward` 负责在 attention 之后进一步变换每个 token 的特征表示。
+如果当前 token 能偷看后面的 token，就作弊了。
+
+所以这个类的核心工作是：
+
+1. 让 token 之间互相参考
+2. 但只允许看左边，不能看右边
+3. 顺便支持 KV cache，把历史信息保存下来
+
+### 你现在只需要记住
+
+`CausalSelfAttention` 是模型最核心的部分，它负责“看上下文”，并且只看过去，不看未来。
 
 ---
 
-## 2.4 `CausalSelfAttention`
+## 3.4 `DecoderLayer`
 
 文件位置：`mini_vllm/model.py`
 
-这个类是整个模型里最关键的一个子模块，因为它实现了：
+你可以把它理解成：
 
-- masked self-attention
-- causal mask
-- KV cache 拼接与返回
+“模型里的一层标准积木。”
 
-它的工作过程可以拆成几步：
+这一层积木里主要装了两样东西：
 
-### 第一步：把输入投影成 Q、K、V
+- `CausalSelfAttention`
+- `FeedForward`
 
-输入 `hidden_states` 先分别经过：
+所以一个 `DecoderLayer` 干的事就是：
 
-- `q_proj`
-- `k_proj`
-- `v_proj`
+1. 先让 token 看看上下文
+2. 再把每个 token 自己加工一下
 
-得到 query、key、value。
+一个语言模型不会只有一层这样的积木，而是会堆很多层。
 
-然后 `_reshape_heads()` 会把张量变成多头 attention 需要的形状，大致是：
+### 你现在只需要记住
 
-`[batch, seq, hidden] -> [batch, heads, seq, head_dim]`
-
-### 第二步：如果有历史 cache，就把旧的 K/V 拼到前面
-
-如果传进来了 `past_key_value`，说明当前不是第一次算，而是在增量解码。
-
-这时会做：
-
-- 当前步新算的 key 拼到旧 key 后面
-- 当前步新算的 value 拼到旧 value 后面
-
-这样新的 attention 就可以同时看到历史 token 和当前 token。
-
-### 第三步：算 attention score
-
-通过：
-
-```python
-query @ key.transpose(-1, -2)
-```
-
-得到每个 query 对所有 key 的相关性分数，再乘缩放因子 `self.scale`。
-
-### 第四步：施加 causal mask
-
-`_build_causal_mask()` 会生成一个“下三角可见”的 mask。
-
-它的含义是：
-
-- 当前 token 只能看见自己以及自己前面的 token
-- 不能偷看未来 token
-
-这就是 decoder-only 模型的“自回归”约束。
-
-### 第五步：施加 attention mask
-
-除了 causal mask，这里还支持额外的 `attention_mask`。
-
-它主要用来处理：
-
-- padding token 不该被看见
-- continuous batching 时，不同请求对齐后补出来的无效位置不该被看见
-
-### 第六步：softmax 后加权求和
-
-对 attention score 做 softmax 得到注意力权重，再对 value 做加权求和，最后过 `out_proj`。
-
-### 第七步：如果 `use_cache=True`，返回新的 KV cache
-
-这里的 `present = (key, value)` 就是本层最新的 KV cache。
-
-引擎在增量解码时，下一轮会把这个 cache 再传回来。
-
-一句话总结：
-
-`CausalSelfAttention` 负责完成 decoder-only 模型最核心的注意力计算，并且承担 KV cache 的读写接口。
+`DecoderLayer` 就是一层 Transformer block，是模型里的重复单元。
 
 ---
 
-## 2.5 `DecoderLayer`
+## 3.5 `DecoderOnlyTransformer`
 
 文件位置：`mini_vllm/model.py`
 
-这个类表示“一个完整的 decoder block”。
+你可以把它理解成：
 
-内部包含：
+“整个语言模型本体。”
 
-- `input_layernorm`
-- `self_attn`
-- `post_attention_layernorm`
-- `mlp`
+前面的 `FeedForward`、`CausalSelfAttention`、`DecoderLayer` 都只是零件。
 
-它的 forward 逻辑是：
+这个类才是把所有零件组装起来的总机器。
 
-1. 对输入做 layer norm
-2. 进 self-attention
-3. 做第一次 residual connection
-4. 再做 layer norm
-5. 进 FFN
-6. 做第二次 residual connection
+它内部做的事情可以粗略理解成：
 
-这就是一个典型的 pre-norm Transformer block。
+1. 把 token id 变成向量
+2. 加上位置信息
+3. 经过很多层 `DecoderLayer`
+4. 最后输出 logits
 
-为什么叫 pre-norm？
+它还负责处理 KV cache，也就是：
 
-因为 layer norm 放在 attention 和 FFN 之前，而不是之后。
+- 如果是第一次看 prompt，就正常算
+- 如果前面已经算过了，就复用历史 cache
 
-一句话总结：
+### 你现在只需要记住
 
-`DecoderLayer` 是一个标准 decoder block，把 attention 和 FFN 串起来，并加上 residual 和 layer norm。
+`DecoderOnlyTransformer` 是“总模型”，其余模型类大多都是它内部的零件。
 
 ---
 
-## 2.6 `DecoderOnlyTransformer`
+## 3.6 `DecoderOnlyTransformerOutput`
 
 文件位置：`mini_vllm/model.py`
 
-这个类是整个最小语言模型本体。
+你可以把它理解成：
 
-你可以把它理解成“把所有零件组装起来的总模型”。
+“模型输出结果的袋子。”
 
-它内部主要包含：
+模型一次前向计算之后，会得到一些结果。
 
-- `token_embedding`
-- `position_embedding`
-- 多层 `DecoderLayer`
-- `final_layernorm`
-- `lm_head`
+这个类就是专门拿来装这些结果的，主要包括：
 
-它的 forward 大致在做下面这些事。
-
-### 1. 处理输入与 cache 长度
-
-它先读取：
-
-- `input_ids`
-- `attention_mask`
-- `position_ids`
+- `logits`
+- `hidden_states`
 - `past_key_values`
 
-如果带了 `past_key_values`，说明当前是在做增量解码，那么 `past_length` 就不为 0。
+你不用把这三个都立刻吃透。
 
-### 2. 构造位置编码
+现阶段先知道：
 
-如果外部没传 `position_ids`，它会自动生成：
+- `logits` 最重要，因为它决定下一个 token 倾向选什么
+- `past_key_values` 很重要，因为它让后续生成更快
 
-- 普通前向：`0, 1, 2, ..., seq_len - 1`
-- 带 cache 的增量解码：从 `past_length` 开始继续编号
+### 你现在只需要记住
 
-这一步保证位置 embedding 能对应到正确的 token 位置。
-
-### 3. 处理 attention mask
-
-它支持两种 mask 长度：
-
-- 只给当前输入长度 `seq_len`
-- 直接给总长度 `past_length + seq_len`
-
-这让它既能支持普通训练式前向，也能支持带 cache 的推理前向。
-
-### 4. token embedding + position embedding
-
-输入 token 会先经过词嵌入，再加上位置嵌入。
-
-这一步得到每个 token 的初始表示。
-
-### 5. 逐层ผ่าน decoder blocks
-
-所有 `DecoderLayer` 会依次执行。
-
-每一层都可能读取自己的旧 cache，并生成自己的新 cache。
-
-### 6. 输出 logits
-
-最后经过：
-
-- `final_layernorm`
-- `lm_head`
-
-得到每个 token 对词表的预测分数 `logits`。
-
-如果 `tie_word_embeddings=True`，那么 `lm_head.weight` 会直接和 `token_embedding.weight` 共用参数。
-
-一句话总结：
-
-`DecoderOnlyTransformer` 是模型总装层，负责把 embedding、stacked decoder layers、lm head 和 KV cache 接口整合起来。
+这个类本身不做计算，它只是把模型的输出整理好。
 
 ---
 
-## 2.7 `GenerationResult`
+## 3.7 `_RequestState`
 
 文件位置：`mini_vllm/engine.py`
 
-这个类表示“一个请求最终生成完成之后的结果”。
+你可以把它理解成：
 
-它保存的信息包括：
+“一个请求在运行过程中的小档案。”
 
-- `request_id`
-- 原始 prompt token
-- 生成出的 output token
-- 请求创建时间
-- 首 token 时间
-- 完成时间
+为什么需要这个档案？
 
-它还提供两个属性：
+因为一个请求不是一下子就完成的。
 
-- `ttft_seconds`
-- `latency_seconds`
+它会经历：
 
-其中：
+1. 刚提交
+2. 处理 prompt
+3. 生成第 1 个 token
+4. 生成第 2 个 token
+5. ...
+6. 最后结束
 
-- TTFT = Time To First Token
-- latency = 整个请求从提交到完成的总耗时
+所以引擎必须记住这个请求当前进行到哪一步。
 
-这两个指标是 benchmark 分析里最核心的延迟指标。
+这个类就是干这个的。
 
-一句话总结：
+它会记住：
 
-`GenerationResult` 是请求完成后的结果对象，重点用于吞吐和延迟分析。
+- 原始 prompt 是什么
+- 已经生成了哪些 token
+- 当前的 KV cache 是什么
+- 下一轮该喂给模型哪个 token
+
+### 你现在只需要记住
+
+`_RequestState` 不是最终结果，它是“请求正在跑的时候的内部状态”。
 
 ---
 
-## 2.8 `_RequestState`
+## 3.8 `GenerationResult`
 
 文件位置：`mini_vllm/engine.py`
 
-这个类是引擎内部维护的“请求运行时状态”。
+你可以把它理解成：
 
-注意前面的下划线 `_`，表示它是内部类，不打算直接给外部用户使用。
+“请求跑完之后的最终成绩单。”
 
-它保存的不是“最终结果”，而是“一个请求在推理过程中当前进展到哪了”。
+和 `_RequestState` 不一样，它不是运行中的状态，而是结束后的结果。
 
-主要字段包括：
+它会记录：
 
-- `prompt_token_ids`
-- `output_token_ids`
-- `past_key_values`
-- `pending_input_id`
-- `first_token_at`
-- `finished_at`
+- 原始 prompt
+- 最终生成的 token
+- 请求什么时候开始
+- 第一个 token 什么时候出来
+- 整个请求什么时候结束
 
-其中两个字段很关键：
+这些信息后面可以用来分析：
 
-### `past_key_values`
+- 首 token 延迟
+- 总延迟
+- 吞吐
 
-表示这个请求当前已经缓存下来的历史 KV。
+### 你现在只需要记住
 
-下次 decode 时，不需要重新算全部前缀，只要喂一个新 token，再把旧 KV 带上就可以了。
-
-### `pending_input_id`
-
-表示“下一轮 decode 要喂给模型的 token”。
-
-例如：
-
-1. prefill 之后，模型会产出第一个生成 token
-2. 这个 token 会被存进 `pending_input_id`
-3. 下一次 decode，就把这个 token 当成模型输入
-
-所以 `_RequestState` 实际上承担了“请求状态机”的作用。
-
-它还有两个辅助接口：
-
-- `cached_tokens`：当前 cache 里已经有多少 token
-- `to_result()`：把内部状态转换成最终的 `GenerationResult`
-
-一句话总结：
-
-`_RequestState` 是单个请求在推理期间的内部状态记录器，连接 prefill、decode、KV cache 和最终结果。
+`GenerationResult` 是最终结果，`_RequestState` 是运行中状态。
 
 ---
 
-## 2.9 `MiniLLMEngine`
+## 3.9 `MiniLLMEngine`
 
 文件位置：`mini_vllm/engine.py`
 
-这个类是当前项目里“最像 vLLM 引擎”的部分。
+你可以把它理解成：
 
-它不负责神经网络数学本身，而是负责：
+“推理调度中心。”
 
-- 接收请求
-- 管理 waiting / active / finished 三类请求
-- 做 prefill
-- 做单步 decode
-- 组织简化 continuous batching
-- 合并和拆分不同请求的 KV cache
+它本身不是神经网络。
 
-你可以把它理解成：模型外面的“调度层”。
+它不负责 attention 数学计算。
 
-### 它维护了三种请求集合
-
-- `_waiting`：刚提交，还没开始 prefill 的请求
-- `_active`：已经做过 prefill，正在逐 token decode 的请求
-- `_finished`：已经结束的请求
-
-### `submit()`
-
-作用是把一个新请求塞进 `_waiting` 队列。
-
-它会创建一个 `_RequestState`，但这时还没有跑模型。
-
-### `step()`
-
-这是引擎最重要的方法。
-
-每执行一次 `step()`，引擎会尝试推进一轮调度：
-
-1. 先从 `_active` 里取出一批请求做 decode
-2. 再用剩余 batch 容量，从 `_waiting` 里取请求做 prefill
-
-这就是这里实现的“简化 continuous batching”。
-
-它不像最完整的 vLLM 那样复杂，但已经具备一个核心思想：
-
-- 不是等所有请求同时开始
-- 而是让新请求可以不断加入已有的运行流程
-
-### `_prefill_batch()`
-
-这个方法处理“第一次完整看到 prompt”的阶段。
-
-它会：
-
-1. 把多个 prompt pad 成一个 batch
-2. 调用模型 `forward(..., use_cache=True)`
-3. 得到每个请求各层的 KV cache
-4. 从 prompt 最后一个位置的 logits 里取出下一个 token
-5. 把请求转入 active 状态
-
-这里的重点是：
-
-- prefill 计算量大，因为要把整段 prompt 全算一遍
-- 但算完后，后面 decode 就可以复用 cache
-
-### `_decode_batch()`
-
-这个方法处理“已经有 cache 后，一次只解一个 token”的阶段。
-
-它会：
-
-1. 取出每个 active 请求的 `pending_input_id`
-2. 把这些 token 合并成一个 batch
-3. 把不同请求的 `past_key_values` 合并起来
-4. 给模型传入 `past_key_values`、`attention_mask`、`position_ids`
-5. 得到新的 logits 和新的 cache
-6. 为每个请求记录新 token，并决定是否结束
-
-这是 KV cache 真正开始发挥作用的地方。
-
-### `_merge_past_key_values()`
-
-因为不同请求的历史长度可能不同，所以没法直接 `torch.cat`。
-
-这个方法会：
-
-- 找到当前 batch 中最大的历史长度
-- 把每个请求的 KV cache 左侧补零
-- 右对齐到相同长度
-- 再拼成一个 batch
-
-为什么是左侧补零？
-
-因为我们要保证“真正的历史 token”在右边对齐，这样配合显式 `position_ids` 和 `attention_mask`，不同请求的位置语义才不会乱掉。
-
-### `_split_past_key_values()`
-
-模型算完之后，返回的是 batched cache。
-
-但引擎内部需要把它重新拆回“每个请求自己的 cache”。
-
-这个方法就负责从 batched KV 里，按每个请求的有效长度切出来，重新放回各自的 `_RequestState`。
-
-### `_record_token()`
-
-这个方法在每生成出一个 token 后更新请求状态。
-
-它会：
-
-- 把 token 加进 `output_token_ids`
-- 更新 `pending_input_id`
-- 记录首 token 时间
-- 判断是不是该结束
-
-如果没结束，就放回 `_active`；
-如果结束了，就转成 `GenerationResult` 放进 `_finished`。
-
-一句话总结：
-
-`MiniLLMEngine` 是整个项目的调度中枢，负责让模型真正以“推理服务”的方式运行起来。
-
----
-
-## 3. 这些 class 怎么串起来工作
-
-可以用一个请求的生命周期来理解。
-
-### 阶段 1：创建模型
-
-先用 `ModelConfig` 定义模型参数，然后创建 `DecoderOnlyTransformer`。
-
-这时模型内部会组装：
-
-- embedding
-- 多层 `DecoderLayer`
-- `lm_head`
-
-### 阶段 2：创建引擎
-
-再把模型交给 `MiniLLMEngine`。
-
-这时引擎开始具备：
+它负责的是：
 
 - 接收请求
 - 组织 batch
-- 保存 cache
-- 统计延迟
+- 决定这一步先算谁
+- 保存每个请求的状态
+- 复用 KV cache
+- 收集最终结果
 
-### 阶段 3：提交请求
+如果没有它，模型虽然能算，但只能傻乎乎地一次处理一个输入。
 
-调用 `engine.submit()` 时，会创建一个 `_RequestState` 并放入 waiting 队列。
+有了它，模型才更像一个真正的推理服务。
 
-### 阶段 4：prefill
+### 它内部最重要的三个概念
 
-引擎执行 `_prefill_batch()`：
+#### 1. waiting
 
-- prompt 进入 `DecoderOnlyTransformer`
-- 每层 `DecoderLayer` 内部都会调用 `CausalSelfAttention`
-- `CausalSelfAttention` 生成每层的 KV cache
-- 最终 cache 被保存进 `_RequestState`
+刚提交、还没开始处理的请求。
 
-### 阶段 5：decode
+#### 2. active
 
-下一步开始只输入一个 token：
+已经开始生成、但还没结束的请求。
 
-- 引擎从 `_RequestState` 里拿出 `pending_input_id`
-- 同时把 `past_key_values` 交给模型
-- attention 里把旧 KV 和新 KV 拼起来
-- 模型输出新的 token 和新的 cache
+#### 3. finished
 
-### 阶段 6：请求结束
+已经结束的请求。
 
-当生成 token 达到上限，或者碰到 `eos_token_id`，引擎把 `_RequestState` 转成 `GenerationResult`。
+所以你可以把 `MiniLLMEngine` 看成：
 
-所以这个项目的基本关系是：
+“不断把请求从 waiting 推到 active，再从 active 推到 finished 的人。”
 
-- `DecoderOnlyTransformer` 负责“算”
-- `MiniLLMEngine` 负责“调度”
-- `_RequestState` 负责“记住每个请求当前到哪了”
-- `GenerationResult` 负责“把最终结果交出来”
+### 你现在只需要记住
+
+`MiniLLMEngine` 是整个项目里最像“服务端调度器”的类。
 
 ---
 
-## 4. 你现在应该抓住的重点
+## 4. 这些 class 是怎么串起来的
 
-如果你是第一次看这种代码，我建议先只抓住下面 4 个核心点：
+这部分只讲最粗的主线。
 
-1. `DecoderOnlyTransformer` 是模型本体
-2. `CausalSelfAttention` 是最核心的计算模块
-3. `_RequestState` 是单个请求的运行时状态
-4. `MiniLLMEngine` 是把模型变成“可服务多个请求”的调度器
-
-只要这四点先清楚，后面再看：
-
-- KV cache 为什么能加速
-- 为什么 prefill 和 decode 分开
-- continuous batching 为什么能提升吞吐
-
-就会顺很多。
+不要急着抠细节。
 
 ---
 
-## 5. 下一份文档适合写什么
+## 第一步：先创建模型
 
-下一步我建议把 `learn/two.md` 专门写成：
+先用 `ModelConfig` 告诉程序：
 
-`一次请求从 submit 到生成完成，到底发生了哪些调用`
+“模型应该长成什么样。”
 
-那一份会更偏“时间顺序”，也就是：
+然后创建 `DecoderOnlyTransformer`。
 
-1. 请求进入 waiting
-2. prefill 发生了什么
-3. decode 发生了什么
-4. KV cache 在哪里生成、在哪里复用
-5. 请求什么时候结束
+这时模型内部会组装好：
 
-如果你要，我下一轮就按这个结构继续写。
+- embedding
+- 多层 `DecoderLayer`
+- 最后的输出层
+
+---
+
+## 第二步：再创建引擎
+
+创建 `MiniLLMEngine`，并把模型交给它。
+
+这时相当于：
+
+- 模型负责算
+- 引擎负责调度
+
+---
+
+## 第三步：请求进来
+
+当你提交一个请求时，引擎会创建一个 `_RequestState`。
+
+此时这个请求还没完成，它只是被登记起来了。
+
+---
+
+## 第四步：模型开始处理 prompt
+
+引擎会调用模型做一次前向计算。
+
+这时在模型内部：
+
+- token 先做 embedding
+- 经过多层 `DecoderLayer`
+- 每层里都有 `CausalSelfAttention` 和 `FeedForward`
+- 最后得到 `DecoderOnlyTransformerOutput`
+
+输出里最重要的两样东西是：
+
+- logits
+- `past_key_values`
+
+---
+
+## 第五步：开始逐个 token 生成
+
+后面每生成一个新 token，引擎都会继续调模型。
+
+这时和第一次不同：
+
+- 不用把整段历史都重算
+- 因为历史信息已经放进 KV cache 了
+
+所以后续生成会更快。
+
+---
+
+## 第六步：请求结束
+
+当生成到指定数量，或者遇到结束 token，请求就结束。
+
+引擎会把 `_RequestState` 变成 `GenerationResult`。
+
+于是：
+
+- 运行中状态结束
+- 最终结果被保存
+
+---
+
+## 5. 这一版你最应该抓住什么
+
+如果你现在只能记住 5 句话，那就记这 5 句：
+
+1. `ModelConfig` 是配置表，不是模型
+2. `DecoderOnlyTransformer` 是总模型
+3. `DecoderLayer` 是模型里重复堆叠的一层
+4. `CausalSelfAttention` 负责看上下文，而且只能看左边
+5. `MiniLLMEngine` 负责调度多个请求，不负责神经网络数学本身
+
+只要这 5 句先稳住，后面再学：
+
+- 为什么 KV cache 能提速
+- 为什么要分 prefill 和 decode
+- 为什么 continuous batching 能提高吞吐
+
+就不会那么乱。
+
+---
+
+## 6. 下一份文档该怎么写
+
+如果这份你觉得顺了，下一份最适合写成：
+
+`一次请求从进入引擎到生成结束，中间到底发生了什么`
+
+也就是只讲时间顺序，不讲太多数学。
+
+建议结构会是：
+
+1. 请求进入 `submit()`
+2. 为什么先处理 prompt
+3. 什么是 prefill
+4. 什么是 decode
+5. KV cache 在哪里产生，在哪里复用
+6. 请求什么时候结束
+
+如果你愿意，我下一轮直接写 `learn/two.md`，并且继续保持这种“零预设”的写法。

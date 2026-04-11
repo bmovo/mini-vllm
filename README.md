@@ -37,6 +37,8 @@ requirements.txt
 
 如果远程机使用 CUDA，请优先按 PyTorch 官方方式安装对应版本，而不是直接依赖默认的 `pip install torch`。
 
+这些脚本已经会自动把仓库根目录加入 `sys.path`，所以直接执行下面的命令即可，不需要额外 `pip install -e .`。
+
 ## 最小使用示例
 
 ```python
